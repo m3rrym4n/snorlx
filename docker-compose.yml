@@ -13,12 +13,12 @@ services:
       - GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET:-}
       - SESSION_SECRET=${SESSION_SECRET:-change-me-in-production}
       # DEV_MODE=true bypasses OAuth credential validation — safe for local dev only
-      - DEV_MODE=${DEV_MODE:-false}
+      - DEV_MODE=${DEV_MODE:-true}
       - PORT=8080
       - LOG_LEVEL=info
-      - FRONTEND_URL=http://localhost:5173
+      - FRONTEND_URL=http://192.168.1.68:5174
     ports:
-      - "3001:8080"
+      - "3006:8080"
     depends_on:
       db:
         condition: service_healthy
@@ -34,7 +34,7 @@ services:
       context: .
       dockerfile: frontend/Dockerfile
       args:
-        - VITE_API_URL=http://localhost:8081
+        - VITE_API_URL=http://192.168.1.68:3006
     ports:
       - "5174:80"
     depends_on:
@@ -62,4 +62,3 @@ services:
 
 volumes:
   pgdata:
-
