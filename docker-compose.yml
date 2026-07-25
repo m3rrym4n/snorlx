@@ -5,6 +5,7 @@ services:
       dockerfile: Dockerfile
     environment:
       # POSTGRES_PASSWORD must be set in your .env file
+      - STORAGE_MODE=database
       - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD}@db:5432/snorlx?sslmode=disable
       - GITHUB_APP_ID=${GITHUB_APP_ID:-}
       - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID:-}
