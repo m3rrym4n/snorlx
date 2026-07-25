@@ -230,6 +230,10 @@ func (h *Handler) AuthMiddleware(next http.Handler) http.Handler {
 					Int("token_len", len(parts[1])).
 					Str("token_hash_prefix", hashAPIToken(parts[1])[:8]).
 					Msg("TEMP-DEBUG auth token details")
+				log.Info().
+					Str("scheme_hex", hex.EncodeToString([]byte(parts[0]))).
+					Bool("scheme_equalfold_bearer", strings.EqualFold(parts[0], "Bearer")).
+					Msg("TEMP-DEBUG scheme raw bytes")
 			}
 			if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") || parts[1] == "" {
 				http.Error(w, "Unauthorized", http.StatusUnauthorized)
