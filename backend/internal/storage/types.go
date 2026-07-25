@@ -57,6 +57,10 @@ type Storage interface {
 	GetSession(ctx context.Context, sessionID string) (*models.Session, *models.User, error)
 	DeleteSession(ctx context.Context, sessionID string) error
 	CleanExpiredSessions(ctx context.Context) error
+	CreateAPIToken(ctx context.Context, token *models.APIToken) error
+	ListAPITokens(ctx context.Context, userID int) ([]models.APIToken, error)
+	AuthenticateAPIToken(ctx context.Context, tokenHash string) (*models.APIToken, *models.User, error)
+	DeleteAPIToken(ctx context.Context, id, userID int) error
 
 	// Dashboard
 	GetDashboardSummary(ctx context.Context) (*models.DashboardSummary, error)
@@ -78,4 +82,3 @@ const (
 	StorageModeMemory   StorageMode = "memory"
 	StorageModeDatabase StorageMode = "database"
 )
-

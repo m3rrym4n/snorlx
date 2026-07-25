@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -60,6 +61,13 @@ func New(cfg *config.Config, store storage.Storage, ghClient *github.Client, wsH
 type contextKey string
 
 const userContextKey contextKey = "user"
+const authMethodContextKey contextKey = "auth_method"
+
+const (
+	authMethodSession = "session"
+	authMethodToken   = "token"
+	apiTokenPrefix    = "snx_"
+)
 
 // ===== Auth Handlers =====
 
@@ -210,6 +218,25 @@ func (h *Handler) AuthStatus(w http.ResponseWriter, r *http.Request) {
 // AuthMiddleware checks if the user is authenticated
 func (h *Handler) AuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if authorization := r.Header.Get("Authorization"); authorization != "" {
+			parts := strings.Fields(authorization)
+			if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") || parts[1] == "" {
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				return
+			}
+
+			_, user, err := h.storage.AuthenticateAPIToken(r.Context(), hashAPIToken(parts[1]))
+			if err != nil || user == nil {
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				return
+			}
+
+			ctx := context.WithValue(r.Context(), userContextKey, user)
+			ctx = context.WithValue(ctx, authMethodContextKey, authMethodToken)
+			next.ServeHTTP(w, r.WithContext(ctx))
+			return
+		}
+
 		sessionCookie, err := r.Cookie("session")
 		if err != nil {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
@@ -225,8 +252,102 @@ func (h *Handler) AuthMiddleware(next http.Handler) http.Handler {
 
 		// Add user to context
 		ctx := context.WithValue(r.Context(), userContextKey, user)
+		ctx = context.WithValue(ctx, authMethodContextKey, authMethodSession)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// SessionOnlyMiddleware prevents API tokens from managing credentials.
+// It must run after AuthMiddleware.
+func (h *Handler) SessionOnlyMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Context().Value(authMethodContextKey) != authMethodSession {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// CreateAPIToken creates a token and returns its raw value exactly once.
+func (h *Handler) CreateAPIToken(w http.ResponseWriter, r *http.Request) {
+	user, ok := r.Context().Value(userContextKey).(*models.User)
+	if !ok || user == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	var request struct {
+		Name string `json:"name"`
+	}
+	decoder := json.NewDecoder(io.LimitReader(r.Body, 4096))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+	request.Name = strings.TrimSpace(request.Name)
+	if request.Name == "" || len(request.Name) > 255 {
+		http.Error(w, "Name must be between 1 and 255 characters", http.StatusBadRequest)
+		return
+	}
+
+	rawToken, err := generateAPIToken()
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to generate API token")
+		http.Error(w, "Failed to create API token", http.StatusInternalServerError)
+		return
+	}
+	token := &models.APIToken{
+		UserID:    user.ID,
+		Name:      request.Name,
+		TokenHash: hashAPIToken(rawToken),
+	}
+	if err := h.storage.CreateAPIToken(r.Context(), token); err != nil {
+		log.Error().Err(err).Msg("Failed to save API token")
+		http.Error(w, "Failed to create API token", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(struct {
+		*models.APIToken
+		Token string `json:"token"`
+	}{APIToken: token, Token: rawToken})
+}
+
+// ListAPITokens lists token metadata for the current user.
+func (h *Handler) ListAPITokens(w http.ResponseWriter, r *http.Request) {
+	user, ok := r.Context().Value(userContextKey).(*models.User)
+	if !ok || user == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	tokens, err := h.storage.ListAPITokens(r.Context(), user.ID)
+	if err != nil {
+		http.Error(w, "Failed to fetch API tokens", http.StatusInternalServerError)
+		return
+	}
+	_ = json.NewEncoder(w).Encode(tokens)
+}
+
+// DeleteAPIToken revokes a token owned by the current user.
+func (h *Handler) DeleteAPIToken(w http.ResponseWriter, r *http.Request) {
+	user, ok := r.Context().Value(userContextKey).(*models.User)
+	if !ok || user == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	id, err := strconv.Atoi(chi.URLParam(r, "id"))
+	if err != nil || id <= 0 {
+		http.Error(w, "API token not found", http.StatusNotFound)
+		return
+	}
+	if err := h.storage.DeleteAPIToken(r.Context(), id, user.ID); err != nil {
+		http.Error(w, "API token not found", http.StatusNotFound)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // ===== Webhook Handler =====
@@ -850,10 +971,10 @@ func (h *Handler) SyncRepository(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":         "ok",
-		"workflows":      workflows,
-		"runs":           runs,
-		"score_updated":  scoreUpdated,
+		"status":        "ok",
+		"workflows":     workflows,
+		"runs":          runs,
+		"score_updated": scoreUpdated,
 	})
 }
 
@@ -1216,7 +1337,7 @@ func (h *Handler) GetJobLogs(w http.ResponseWriter, r *http.Request) {
 
 // WorkflowDefinition represents the parsed workflow YAML structure
 type WorkflowDefinition struct {
-	Name string                            `yaml:"name" json:"name"`
+	Name string                           `yaml:"name" json:"name"`
 	Jobs map[string]WorkflowJobDefinition `yaml:"jobs" json:"jobs"`
 }
 
@@ -1407,7 +1528,7 @@ func (h *Handler) GetRunWorkflowDefinition(w http.ResponseWriter, r *http.Reques
 				// External reusable workflow: org/repo/.github/workflows/file.yml@ref
 				// or org/repo/path/to/workflow.yml@ref
 				isLocal = false
-				
+
 				// Parse the external workflow path
 				// Format: {owner}/{repo}/{path}@{ref} or {owner}/{repo}/.github/workflows/{filename}@{ref}
 				atIdx := strings.LastIndex(reusablePath, "@")
@@ -1417,7 +1538,7 @@ func (h *Handler) GetRunWorkflowDefinition(w http.ResponseWriter, r *http.Reques
 				} else {
 					reusableRef = "main" // Default to main if no ref specified
 				}
-				
+
 				// Split the path: owner/repo/path/to/file.yml
 				pathParts := strings.SplitN(reusablePath, "/", 3)
 				if len(pathParts) >= 3 {
@@ -1807,16 +1928,16 @@ func (h *Handler) refreshRunsFromGitHub(ctx context.Context, runs []models.Workf
 
 func (h *Handler) convertWorkflowRun(run *gh.WorkflowRun, repo *gh.Repository) *models.WorkflowRun {
 	result := &models.WorkflowRun{
-		GitHubID:    run.GetID(),
-		RunNumber:   run.GetRunNumber(),
-		Name:        run.GetName(),
-		Status:      run.GetStatus(),
-		Event:       run.GetEvent(),
-		Branch:      run.GetHeadBranch(),
-		CommitSHA:   run.GetHeadSHA(),
-		ActorLogin:  run.GetActor().GetLogin(),
-		HTMLURL:     run.GetHTMLURL(),
-		StartedAt:   run.GetRunStartedAt().Time,
+		GitHubID:   run.GetID(),
+		RunNumber:  run.GetRunNumber(),
+		Name:       run.GetName(),
+		Status:     run.GetStatus(),
+		Event:      run.GetEvent(),
+		Branch:     run.GetHeadBranch(),
+		CommitSHA:  run.GetHeadSHA(),
+		ActorLogin: run.GetActor().GetLogin(),
+		HTMLURL:    run.GetHTMLURL(),
+		StartedAt:  run.GetRunStartedAt().Time,
 	}
 
 	if run.Conclusion != nil {
@@ -1984,6 +2105,19 @@ func generateSessionID() string {
 	b := make([]byte, 32)
 	rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+func generateAPIToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return apiTokenPrefix + hex.EncodeToString(b), nil
+}
+
+func hashAPIToken(token string) string {
+	hash := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(hash[:])
 }
 
 // isSecureRequest returns true when the connection is HTTPS, either directly

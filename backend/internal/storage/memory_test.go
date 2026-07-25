@@ -572,6 +572,64 @@ func TestCleanExpiredSessions(t *testing.T) {
 	}
 }
 
+func TestAPITokenLifecycle(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage()
+	user, err := s.UpsertUser(ctx, &models.User{GitHubID: 42, Login: "sensor-owner"})
+	if err != nil {
+		t.Fatalf("UpsertUser failed: %v", err)
+	}
+	token := &models.APIToken{UserID: user.ID, Name: "Home Assistant", TokenHash: "hash"}
+	if err := s.CreateAPIToken(ctx, token); err != nil {
+		t.Fatalf("CreateAPIToken failed: %v", err)
+	}
+
+	tokens, err := s.ListAPITokens(ctx, user.ID)
+	if err != nil || len(tokens) != 1 {
+		t.Fatalf("expected one token, got %d: %v", len(tokens), err)
+	}
+	if tokens[0].TokenHash != "" {
+		t.Error("ListAPITokens must not expose token hashes")
+	}
+
+	authenticatedToken, authenticatedUser, err := s.AuthenticateAPIToken(ctx, "hash")
+	if err != nil {
+		t.Fatalf("AuthenticateAPIToken failed: %v", err)
+	}
+	if authenticatedUser.ID != user.ID || authenticatedToken.LastUsedAt == nil {
+		t.Error("expected token owner and updated last_used_at")
+	}
+
+	if err := s.DeleteAPIToken(ctx, token.ID, user.ID); err != nil {
+		t.Fatalf("DeleteAPIToken failed: %v", err)
+	}
+	if _, _, err := s.AuthenticateAPIToken(ctx, "hash"); err == nil {
+		t.Error("revoked token should not authenticate")
+	}
+}
+
+func TestExpiredAPITokenDoesNotAuthenticate(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage()
+	user, err := s.UpsertUser(ctx, &models.User{GitHubID: 43, Login: "expired-owner"})
+	if err != nil {
+		t.Fatalf("UpsertUser failed: %v", err)
+	}
+	expired := time.Now().Add(-time.Minute)
+	token := &models.APIToken{
+		UserID:    user.ID,
+		Name:      "Expired",
+		TokenHash: "expired-hash",
+		ExpiresAt: &expired,
+	}
+	if err := s.CreateAPIToken(ctx, token); err != nil {
+		t.Fatalf("CreateAPIToken failed: %v", err)
+	}
+	if _, _, err := s.AuthenticateAPIToken(ctx, token.TokenHash); err == nil {
+		t.Error("expired token should not authenticate")
+	}
+}
+
 // ===== Dashboard & Metrics =====
 
 func TestGetDashboardSummary(t *testing.T) {
@@ -640,11 +698,11 @@ func TestBackfillDeploymentRuns(t *testing.T) {
 
 	// Run without IsDeployment set
 	run := &models.WorkflowRun{
-		GitHubID:    100,
-		WorkflowID:  wf.ID,
-		RepoID:     repo.ID,
-		StartedAt:  time.Now(),
-		Event:      "push",
+		GitHubID:     100,
+		WorkflowID:   wf.ID,
+		RepoID:       repo.ID,
+		StartedAt:    time.Now(),
+		Event:        "push",
 		IsDeployment: false,
 	}
 	_, err := s.UpsertRun(ctx, run)

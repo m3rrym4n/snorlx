@@ -19,24 +19,26 @@ type MemoryStorage struct {
 	mu sync.RWMutex
 
 	// Auto-increment IDs
-	orgIDCounter    int32
-	repoIDCounter   int32
+	orgIDCounter      int32
+	repoIDCounter     int32
 	workflowIDCounter int32
-	runIDCounter    int32
-	jobIDCounter    int32
-	deployIDCounter  int32
-	userIDCounter    int32
-	scoreIDCounter   int32
+	runIDCounter      int32
+	jobIDCounter      int32
+	deployIDCounter   int32
+	userIDCounter     int32
+	scoreIDCounter    int32
+	apiTokenIDCounter int32
 
 	// Data stores
-	organizations map[int]*models.Organization
-	repositories  map[int]*models.Repository
-	workflows     map[int]*models.Workflow
-	runs          map[int]*models.WorkflowRun
-	jobs          map[int]*models.WorkflowJob
+	organizations    map[int]*models.Organization
+	repositories     map[int]*models.Repository
+	workflows        map[int]*models.Workflow
+	runs             map[int]*models.WorkflowRun
+	jobs             map[int]*models.WorkflowJob
 	deployments      map[int]*models.Deployment
 	users            map[int]*models.User
 	sessions         map[string]*models.Session
+	apiTokens        map[int]*models.APIToken
 	repositoryScores map[int]*models.RepositoryScore
 
 	// GitHub ID indexes for fast lookups
@@ -59,7 +61,8 @@ func NewMemoryStorage() *MemoryStorage {
 		deployments:         make(map[int]*models.Deployment),
 		users:               make(map[int]*models.User),
 		sessions:            make(map[string]*models.Session),
-		repositoryScores:   make(map[int]*models.RepositoryScore),
+		apiTokens:           make(map[int]*models.APIToken),
+		repositoryScores:    make(map[int]*models.RepositoryScore),
 		orgGitHubIndex:      make(map[int64]int),
 		repoGitHubIndex:     make(map[int64]int),
 		workflowGitHubIndex: make(map[int64]int),
@@ -794,6 +797,75 @@ func (m *MemoryStorage) CleanExpiredSessions(ctx context.Context) error {
 	return nil
 }
 
+func (m *MemoryStorage) CreateAPIToken(ctx context.Context, token *models.APIToken) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, existing := range m.apiTokens {
+		if existing.TokenHash == token.TokenHash {
+			return errors.New("API token already exists")
+		}
+	}
+	token.ID = int(atomic.AddInt32(&m.apiTokenIDCounter, 1))
+	token.CreatedAt = time.Now()
+	tokenCopy := *token
+	m.apiTokens[token.ID] = &tokenCopy
+	return nil
+}
+
+func (m *MemoryStorage) ListAPITokens(ctx context.Context, userID int) ([]models.APIToken, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	tokens := make([]models.APIToken, 0)
+	for _, token := range m.apiTokens {
+		if token.UserID == userID {
+			tokenCopy := *token
+			tokenCopy.TokenHash = ""
+			tokens = append(tokens, tokenCopy)
+		}
+	}
+	sort.Slice(tokens, func(i, j int) bool {
+		return tokens[i].CreatedAt.After(tokens[j].CreatedAt)
+	})
+	return tokens, nil
+}
+
+func (m *MemoryStorage) AuthenticateAPIToken(ctx context.Context, tokenHash string) (*models.APIToken, *models.User, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, token := range m.apiTokens {
+		if token.TokenHash != tokenHash {
+			continue
+		}
+		if token.ExpiresAt != nil && !token.ExpiresAt.After(time.Now()) {
+			return nil, nil, errors.New("API token not found or expired")
+		}
+		user, ok := m.users[token.UserID]
+		if !ok {
+			return nil, nil, errors.New("user not found")
+		}
+		now := time.Now()
+		token.LastUsedAt = &now
+		tokenCopy := *token
+		return &tokenCopy, user, nil
+	}
+	return nil, nil, errors.New("API token not found or expired")
+}
+
+func (m *MemoryStorage) DeleteAPIToken(ctx context.Context, id, userID int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	token, ok := m.apiTokens[id]
+	if !ok || token.UserID != userID {
+		return errors.New("API token not found")
+	}
+	delete(m.apiTokens, id)
+	return nil
+}
+
 // ===== Dashboard & Metrics =====
 
 func (m *MemoryStorage) GetDashboardSummary(ctx context.Context) (*models.DashboardSummary, error) {
@@ -824,7 +896,7 @@ func (m *MemoryStorage) GetDashboardSummary(ctx context.Context) (*models.Dashbo
 
 	// Calculate date ranges for current and previous periods (last 30 days and 30-60 days ago)
 	now := time.Now()
-	currentPeriodStart := now.AddDate(0, 0, -30) // 30 days ago
+	currentPeriodStart := now.AddDate(0, 0, -30)  // 30 days ago
 	previousPeriodStart := now.AddDate(0, 0, -60) // 60 days ago
 	previousPeriodEnd := currentPeriodStart
 
@@ -1070,4 +1142,3 @@ func (m *MemoryStorage) ListLatestRepositoryScores(ctx context.Context) ([]model
 	sort.Slice(out, func(i, j int) bool { return out[i].RepoID < out[j].RepoID })
 	return out, nil
 }
-
