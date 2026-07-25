@@ -220,21 +220,6 @@ func (h *Handler) AuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if authorization := r.Header.Get("Authorization"); authorization != "" {
 			parts := strings.Fields(authorization)
-			log.Info().
-				Int("header_len", len(authorization)).
-				Int("parts_count", len(parts)).
-				Msg("TEMP-DEBUG auth header received")
-			if len(parts) == 2 {
-				log.Info().
-					Int("scheme_len", len(parts[0])).
-					Int("token_len", len(parts[1])).
-					Str("token_hash_prefix", hashAPIToken(parts[1])[:8]).
-					Msg("TEMP-DEBUG auth token details")
-				log.Info().
-					Str("scheme_hex", hex.EncodeToString([]byte(parts[0]))).
-					Bool("scheme_equalfold_bearer", strings.EqualFold(parts[0], "Bearer")).
-					Msg("TEMP-DEBUG scheme raw bytes")
-			}
 			if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") || parts[1] == "" {
 				http.Error(w, "Unauthorized", http.StatusUnauthorized)
 				return
@@ -242,7 +227,6 @@ func (h *Handler) AuthMiddleware(next http.Handler) http.Handler {
 
 			_, user, err := h.storage.AuthenticateAPIToken(r.Context(), hashAPIToken(parts[1]))
 			if err != nil || user == nil {
-				log.Info().Err(err).Msg("TEMP-DEBUG AuthenticateAPIToken failed")
 				http.Error(w, "Unauthorized", http.StatusUnauthorized)
 				return
 			}
@@ -319,10 +303,6 @@ func (h *Handler) CreateAPIToken(w http.ResponseWriter, r *http.Request) {
 		Name:      request.Name,
 		TokenHash: hashAPIToken(rawToken),
 	}
-	log.Info().
-		Int("raw_token_len", len(rawToken)).
-		Str("token_hash_prefix", token.TokenHash[:8]).
-		Msg("TEMP-DEBUG created API token")
 	if err := h.storage.CreateAPIToken(r.Context(), token); err != nil {
 		log.Error().Err(err).Msg("Failed to save API token")
 		http.Error(w, "Failed to create API token", http.StatusInternalServerError)
