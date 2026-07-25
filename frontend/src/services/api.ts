@@ -11,6 +11,8 @@ import type {
 	ListResponse,
 	RunFilters,
 	JobDependency,
+	APIToken,
+	CreatedAPIToken,
 } from "../types";
 
 const API_URL = import.meta.env.VITE_API_URL || "";
@@ -33,14 +35,30 @@ async function fetchApi<T>(
 		throw new Error(error || `HTTP error ${response.status}`);
 	}
 
+	if (response.status === httpNoContent) {
+		return undefined as T;
+	}
 	return response.json();
 }
+
+const httpNoContent = 204;
 
 // Auth API
 export const authApi = {
 	getStatus: () =>
 		fetchApi<{ authenticated: boolean; user?: User }>("/api/auth/status"),
 	logout: () => fetchApi<void>("/api/auth/logout", { method: "POST" }),
+};
+
+export const tokensApi = {
+	list: () => fetchApi<APIToken[]>("/api/tokens"),
+	create: (name: string) =>
+		fetchApi<CreatedAPIToken>("/api/tokens", {
+			method: "POST",
+			body: JSON.stringify({ name }),
+		}),
+	revoke: (id: number) =>
+		fetchApi<void>(`/api/tokens/${id}`, { method: "DELETE" }),
 };
 
 // Organizations API

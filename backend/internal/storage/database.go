@@ -953,6 +953,72 @@ func (d *DatabaseStorage) CleanExpiredSessions(ctx context.Context) error {
 	return err
 }
 
+func (d *DatabaseStorage) CreateAPIToken(ctx context.Context, token *models.APIToken) error {
+	return d.pool.QueryRow(ctx, `
+		INSERT INTO api_tokens (user_id, name, token_hash, expires_at)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id, created_at
+	`, token.UserID, token.Name, token.TokenHash, token.ExpiresAt).Scan(&token.ID, &token.CreatedAt)
+}
+
+func (d *DatabaseStorage) ListAPITokens(ctx context.Context, userID int) ([]models.APIToken, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT id, user_id, name, created_at, last_used_at, expires_at
+		FROM api_tokens
+		WHERE user_id = $1
+		ORDER BY created_at DESC
+	`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	tokens := make([]models.APIToken, 0)
+	for rows.Next() {
+		var token models.APIToken
+		if err := rows.Scan(&token.ID, &token.UserID, &token.Name, &token.CreatedAt, &token.LastUsedAt, &token.ExpiresAt); err != nil {
+			return nil, err
+		}
+		tokens = append(tokens, token)
+	}
+	return tokens, rows.Err()
+}
+
+func (d *DatabaseStorage) AuthenticateAPIToken(ctx context.Context, tokenHash string) (*models.APIToken, *models.User, error) {
+	var token models.APIToken
+	var user models.User
+	err := d.pool.QueryRow(ctx, `
+		UPDATE api_tokens t
+		SET last_used_at = NOW()
+		FROM users u
+		WHERE t.token_hash = $1
+		  AND t.user_id = u.id
+		  AND (t.expires_at IS NULL OR t.expires_at > NOW())
+		RETURNING t.id, t.user_id, t.name, t.created_at, t.last_used_at, t.expires_at,
+		          u.id, u.github_id, u.login, u.name, u.email, u.avatar_url,
+		          u.access_token, u.refresh_token, u.token_expires_at, u.created_at, u.updated_at
+	`, tokenHash).Scan(
+		&token.ID, &token.UserID, &token.Name, &token.CreatedAt, &token.LastUsedAt, &token.ExpiresAt,
+		&user.ID, &user.GitHubID, &user.Login, &user.Name, &user.Email, &user.AvatarURL,
+		&user.AccessToken, &user.RefreshToken, &user.TokenExpiresAt, &user.CreatedAt, &user.UpdatedAt,
+	)
+	if err != nil {
+		return nil, nil, errors.New("API token not found or expired")
+	}
+	return &token, &user, nil
+}
+
+func (d *DatabaseStorage) DeleteAPIToken(ctx context.Context, id, userID int) error {
+	result, err := d.pool.Exec(ctx, "DELETE FROM api_tokens WHERE id = $1 AND user_id = $2", id, userID)
+	if err != nil {
+		return err
+	}
+	if result.RowsAffected() == 0 {
+		return errors.New("API token not found")
+	}
+	return nil
+}
+
 // ===== Dashboard & Metrics =====
 
 func (d *DatabaseStorage) GetDashboardSummary(ctx context.Context) (*models.DashboardSummary, error) {
@@ -1402,6 +1468,20 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
 
+-- Long-lived API tokens for headless clients. Only the SHA-256 hash is stored.
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    token_hash CHAR(64) UNIQUE NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_used_at TIMESTAMPTZ,
+    expires_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_tokens_user_id ON api_tokens(user_id);
+CREATE INDEX IF NOT EXISTS idx_api_tokens_token_hash ON api_tokens(token_hash);
+
 -- Repository scores table
 CREATE TABLE IF NOT EXISTS repository_scores (
     id SERIAL PRIMARY KEY,
@@ -1455,4 +1535,3 @@ SELECT add_continuous_aggregate_policy('daily_workflow_metrics',
 SELECT add_retention_policy('workflow_runs', INTERVAL '1 year', if_not_exists => TRUE);
 SELECT add_retention_policy('workflow_jobs', INTERVAL '1 year', if_not_exists => TRUE);
 `
-

@@ -3,8 +3,10 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,14 +19,18 @@ import (
 // ===== Mock Storage =====
 
 type mockStorage struct {
-	getSessionFunc func(ctx context.Context, sessionID string) (*models.Session, *models.User, error)
-	deleteSessionFunc func(ctx context.Context, sessionID string) error
-	listOrgsFunc      func(ctx context.Context) ([]models.Organization, error)
-	getDashboardFunc  func(ctx context.Context) (*models.DashboardSummary, error)
-	getTrendsFunc     func(ctx context.Context, days int) ([]models.Trend, error)
+	getSessionFunc           func(ctx context.Context, sessionID string) (*models.Session, *models.User, error)
+	deleteSessionFunc        func(ctx context.Context, sessionID string) error
+	listOrgsFunc             func(ctx context.Context) ([]models.Organization, error)
+	getDashboardFunc         func(ctx context.Context) (*models.DashboardSummary, error)
+	getTrendsFunc            func(ctx context.Context, days int) ([]models.Trend, error)
+	authenticateAPITokenFunc func(ctx context.Context, tokenHash string) (*models.APIToken, *models.User, error)
+	createAPITokenFunc       func(ctx context.Context, token *models.APIToken) error
+	listAPITokensFunc        func(ctx context.Context, userID int) ([]models.APIToken, error)
+	deleteAPITokenFunc       func(ctx context.Context, id, userID int) error
 }
 
-func (m *mockStorage) Close() error { return nil }
+func (m *mockStorage) Close() error   { return nil }
 func (m *mockStorage) Migrate() error { return nil }
 func (m *mockStorage) ListOrganizations(ctx context.Context) ([]models.Organization, error) {
 	if m.listOrgsFunc != nil {
@@ -123,6 +129,30 @@ func (m *mockStorage) DeleteSession(ctx context.Context, sessionID string) error
 	return nil
 }
 func (m *mockStorage) CleanExpiredSessions(ctx context.Context) error { return nil }
+func (m *mockStorage) CreateAPIToken(ctx context.Context, token *models.APIToken) error {
+	if m.createAPITokenFunc != nil {
+		return m.createAPITokenFunc(ctx, token)
+	}
+	return nil
+}
+func (m *mockStorage) ListAPITokens(ctx context.Context, userID int) ([]models.APIToken, error) {
+	if m.listAPITokensFunc != nil {
+		return m.listAPITokensFunc(ctx, userID)
+	}
+	return []models.APIToken{}, nil
+}
+func (m *mockStorage) AuthenticateAPIToken(ctx context.Context, tokenHash string) (*models.APIToken, *models.User, error) {
+	if m.authenticateAPITokenFunc != nil {
+		return m.authenticateAPITokenFunc(ctx, tokenHash)
+	}
+	return nil, nil, errors.New("API token not found")
+}
+func (m *mockStorage) DeleteAPIToken(ctx context.Context, id, userID int) error {
+	if m.deleteAPITokenFunc != nil {
+		return m.deleteAPITokenFunc(ctx, id, userID)
+	}
+	return nil
+}
 func (m *mockStorage) GetDashboardSummary(ctx context.Context) (*models.DashboardSummary, error) {
 	if m.getDashboardFunc != nil {
 		return m.getDashboardFunc(ctx)
@@ -352,6 +382,123 @@ func TestAuthMiddleware_ValidSession_CallsNext(t *testing.T) {
 
 	if !called {
 		t.Error("expected next handler to be called for valid session")
+	}
+}
+
+func TestAuthMiddleware_ValidBearerToken_CallsNextAndSetsUser(t *testing.T) {
+	user := &models.User{ID: 7, Login: "sensor"}
+	rawToken := "snx_test-token"
+	store := &mockStorage{
+		authenticateAPITokenFunc: func(ctx context.Context, tokenHash string) (*models.APIToken, *models.User, error) {
+			if tokenHash != hashAPIToken(rawToken) {
+				t.Fatalf("unexpected token hash %q", tokenHash)
+			}
+			now := time.Now()
+			return &models.APIToken{ID: 1, UserID: user.ID, LastUsedAt: &now}, user, nil
+		},
+	}
+	h := newTestHandler(store)
+
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		contextUser, _ := r.Context().Value(userContextKey).(*models.User)
+		if contextUser != user {
+			t.Error("expected bearer token owner in request context")
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	req := httptest.NewRequest(http.MethodGet, "/api/runs", nil)
+	req.Header.Set("Authorization", "Bearer "+rawToken)
+	rec := httptest.NewRecorder()
+
+	h.AuthMiddleware(next).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+}
+
+func TestAuthMiddleware_InvalidBearerDoesNotFallBackToSession(t *testing.T) {
+	sessionCalled := false
+	store := &mockStorage{
+		authenticateAPITokenFunc: func(ctx context.Context, tokenHash string) (*models.APIToken, *models.User, error) {
+			return nil, nil, errors.New("invalid token")
+		},
+		getSessionFunc: func(ctx context.Context, sessionID string) (*models.Session, *models.User, error) {
+			sessionCalled = true
+			return nil, nil, nil
+		},
+	}
+	h := newTestHandler(store)
+	req := httptest.NewRequest(http.MethodGet, "/api/runs", nil)
+	req.Header.Set("Authorization", "Bearer unknown")
+	req.AddCookie(&http.Cookie{Name: "session", Value: "valid"})
+	rec := httptest.NewRecorder()
+
+	h.AuthMiddleware(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", rec.Code)
+	}
+	if sessionCalled {
+		t.Error("session fallback must not run when an Authorization header is present")
+	}
+}
+
+func TestSessionOnlyMiddleware_RejectsBearerAuthentication(t *testing.T) {
+	h := newTestHandler(&mockStorage{})
+	req := httptest.NewRequest(http.MethodGet, "/api/tokens", nil)
+	ctx := context.WithValue(req.Context(), authMethodContextKey, authMethodToken)
+	rec := httptest.NewRecorder()
+
+	h.SessionOnlyMiddleware(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Error("token-authenticated request should not reach token management")
+	})).ServeHTTP(rec, req.WithContext(ctx))
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", rec.Code)
+	}
+}
+
+func TestCreateAPIToken_ReturnsRawTokenOnceAndStoresOnlyHash(t *testing.T) {
+	user := &models.User{ID: 9}
+	var stored *models.APIToken
+	store := &mockStorage{
+		createAPITokenFunc: func(ctx context.Context, token *models.APIToken) error {
+			copy := *token
+			copy.ID = 12
+			copy.CreatedAt = time.Now()
+			*token = copy
+			stored = &copy
+			return nil
+		},
+	}
+	h := newTestHandler(store)
+	req := httptest.NewRequest(http.MethodPost, "/api/tokens", strings.NewReader(`{"name":" Home Assistant "}`))
+	req = req.WithContext(context.WithValue(req.Context(), userContextKey, user))
+	rec := httptest.NewRecorder()
+
+	h.CreateAPIToken(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		ID        int    `json:"id"`
+		Name      string `json:"name"`
+		Token     string `json:"token"`
+		TokenHash string `json:"token_hash"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(response.Token, apiTokenPrefix) {
+		t.Fatalf("expected recognizable token prefix, got %q", response.Token)
+	}
+	if response.Name != "Home Assistant" || stored.TokenHash != hashAPIToken(response.Token) {
+		t.Error("expected trimmed name and hash of returned token to be stored")
+	}
+	if stored.TokenHash == response.Token || response.TokenHash != "" {
+		t.Error("raw token must not be stored and token hash must not be returned")
 	}
 }
 

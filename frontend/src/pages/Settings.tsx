@@ -1,9 +1,66 @@
-import { Settings as SettingsIcon, Moon, Sun, Monitor, Shield, Database } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { Settings as SettingsIcon, Moon, Sun, Monitor, Shield, Database, KeyRound, Copy, Check, Trash2 } from 'lucide-react';
 import { useTheme } from '../context/ThemeContext';
 import { cn } from '../lib/utils';
+import { tokensApi } from '../services/api';
+import type { APIToken } from '../types';
 
 export function Settings() {
   const { theme, setTheme } = useTheme();
+  const [tokens, setTokens] = useState<APIToken[]>([]);
+  const [tokenName, setTokenName] = useState('');
+  const [newToken, setNewToken] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+  const [loadingTokens, setLoadingTokens] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
+  const [tokenError, setTokenError] = useState<string | null>(null);
+
+  useEffect(() => {
+    tokensApi.list()
+      .then(setTokens)
+      .catch((error: unknown) => {
+        setTokenError(error instanceof Error ? error.message : 'Failed to load API tokens');
+      })
+      .finally(() => setLoadingTokens(false));
+  }, []);
+
+  const createToken = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!tokenName.trim()) return;
+    setSubmitting(true);
+    setTokenError(null);
+    try {
+      const created = await tokensApi.create(tokenName.trim());
+      setTokens((current) => [created, ...current]);
+      setNewToken(created.token);
+      setTokenName('');
+      setCopied(false);
+    } catch (error) {
+      setTokenError(error instanceof Error ? error.message : 'Failed to create API token');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const copyToken = async () => {
+    if (!newToken) return;
+    await navigator.clipboard.writeText(newToken);
+    setCopied(true);
+  };
+
+  const revokeToken = async (id: number) => {
+    setTokenError(null);
+    try {
+      await tokensApi.revoke(id);
+      setTokens((current) => current.filter((token) => token.id !== id));
+    } catch (error) {
+      setTokenError(error instanceof Error ? error.message : 'Failed to revoke API token');
+    }
+  };
+
+  const formatDate = (value: string | null) => value
+    ? new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value))
+    : 'Never';
 
   return (
     <div className="space-y-6">
@@ -50,6 +107,91 @@ export function Settings() {
                 ))}
               </div>
             </div>
+          </div>
+        </div>
+      </div>
+
+      {/* API Tokens */}
+      <div className="card">
+        <div className="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
+          <div className="flex items-center gap-2">
+            <KeyRound className="w-5 h-5 text-gray-500" />
+            <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-100">API Tokens</h2>
+          </div>
+        </div>
+        <div className="p-6 space-y-5">
+          <p className="text-sm text-gray-500 dark:text-gray-400">
+            Create a long-lived token for trusted headless clients such as Home Assistant.
+          </p>
+
+          <form onSubmit={createToken} className="flex flex-col sm:flex-row gap-3">
+            <label className="sr-only" htmlFor="api-token-name">Token name</label>
+            <input
+              id="api-token-name"
+              value={tokenName}
+              maxLength={255}
+              onChange={(event) => setTokenName(event.target.value)}
+              placeholder="Home Assistant"
+              className="flex-1 px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100"
+            />
+            <button
+              type="submit"
+              disabled={submitting || !tokenName.trim()}
+              className="px-4 py-2 rounded-lg bg-primary-600 text-white hover:bg-primary-700 disabled:opacity-50"
+            >
+              {submitting ? 'Creating…' : 'Create token'}
+            </button>
+          </form>
+
+          {newToken && (
+            <div className="p-4 rounded-lg border border-amber-300 bg-amber-50 dark:border-amber-700 dark:bg-amber-900/20">
+              <p className="font-medium text-amber-900 dark:text-amber-200">
+                Copy this token now. It won&apos;t be shown again.
+              </p>
+              <div className="flex gap-2 mt-3">
+                <code className="min-w-0 flex-1 overflow-x-auto p-2 rounded bg-white dark:bg-gray-900 text-sm text-gray-900 dark:text-gray-100">
+                  {newToken}
+                </code>
+                <button
+                  type="button"
+                  onClick={copyToken}
+                  className="flex items-center gap-2 px-3 py-2 rounded-lg border border-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/40"
+                >
+                  {copied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+                  {copied ? 'Copied' : 'Copy'}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {tokenError && (
+            <p role="alert" className="text-sm text-red-600 dark:text-red-400">{tokenError}</p>
+          )}
+
+          <div className="divide-y divide-gray-200 dark:divide-gray-700">
+            {loadingTokens && <p className="py-4 text-sm text-gray-500">Loading tokens…</p>}
+            {!loadingTokens && tokens.length === 0 && (
+              <p className="py-4 text-sm text-gray-500 dark:text-gray-400">No API tokens yet.</p>
+            )}
+            {tokens.map((token) => (
+              <div key={token.id} className="py-4 flex items-center justify-between gap-4">
+                <div>
+                  <p className="font-medium text-gray-900 dark:text-gray-100">{token.name}</p>
+                  <p className="text-sm text-gray-500 dark:text-gray-400">
+                    Created {formatDate(token.created_at)} · Last used {formatDate(token.last_used_at)}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => revokeToken(token.id)}
+                  className="flex items-center gap-2 px-3 py-2 rounded-lg text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20"
+                  aria-label={`Revoke ${token.name}`}
+                >
+                  <Trash2 className="w-4 h-4" />
+                  Revoke
+                </button>
+              </div>
+            ))}
           </div>
         </div>
       </div>
@@ -117,4 +259,3 @@ export function Settings() {
     </div>
   );
 }
-

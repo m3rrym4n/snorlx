@@ -6,6 +6,18 @@ export interface User {
 	avatar_url: string | null;
 }
 
+export interface APIToken {
+	id: number;
+	name: string;
+	created_at: string;
+	last_used_at: string | null;
+	expires_at: string | null;
+}
+
+export interface CreatedAPIToken extends APIToken {
+	token: string;
+}
+
 export interface Organization {
 	id: number;
 	github_id: number;
@@ -178,4 +190,3 @@ export interface JobDependency {
 	is_matrix?: boolean;
 	prefix?: string; // Prefix for job names (e.g., calling job name for reusable workflows)
 }
-

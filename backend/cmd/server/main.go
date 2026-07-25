@@ -27,7 +27,7 @@ import (
 
 func main() {
 	// Load .env file if it exists (try current dir, then parent for monorepo setup)
-	_ = godotenv.Load()       // ./backend/.env
+	_ = godotenv.Load()          // ./backend/.env
 	_ = godotenv.Load("../.env") // ./.env (project root)
 
 	// Configure zerolog
@@ -135,6 +135,13 @@ func main() {
 			r.Use(h.AuthMiddleware)
 			// CSRF protection: validate Origin header on state-changing requests
 			r.Use(csrfMiddleware(cfg.FrontendURL))
+
+			// API token management always requires a browser session. Bearer
+			// tokens authenticate other protected endpoints but cannot manage
+			// credentials, including themselves.
+			r.With(h.SessionOnlyMiddleware).Post("/tokens", h.CreateAPIToken)
+			r.With(h.SessionOnlyMiddleware).Get("/tokens", h.ListAPITokens)
+			r.With(h.SessionOnlyMiddleware).Delete("/tokens/{id}", h.DeleteAPIToken)
 
 			// Pipelines (literal path first so it is not shadowed by /runs/{id})
 			r.Get("/pipelines/active", h.ListActivePipelines)
