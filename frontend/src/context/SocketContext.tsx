@@ -62,8 +62,13 @@ export function SocketProvider({ children }: { children: ReactNode }) {
 	);
 
 	useEffect(() => {
+		// Split-host deployments (frontend and backend on different origins) must derive
+		// the WebSocket URL from VITE_API_URL rather than the page's own origin.
+		const apiUrl = import.meta.env.VITE_API_URL as string | undefined;
 		const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-		const wsUrl = `${wsProtocol}//${window.location.host}/ws`;
+		const wsUrl = apiUrl
+			? `${apiUrl.replace(/^http/, "ws")}/ws`
+			: `${wsProtocol}//${window.location.host}/ws`;
 
 		let ws: WebSocket | null = null;
 		let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
